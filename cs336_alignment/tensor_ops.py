@@ -3,6 +3,27 @@ from __future__ import annotations
 import torch
 
 
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+) -> torch.Tensor:
+    """Average tensor values over the elements selected by ``mask``.
+
+    Args:
+        tensor: Tensor to reduce.
+        mask: Boolean or 0/1 tensor with the same shape as ``tensor``.
+        dim: Dimension to reduce over. If None, reduce across all dimensions.
+
+    Returns:
+        Tensor containing the masked mean reduction.
+    """
+    mask = mask.to(dtype=tensor.dtype)
+    masked_tensor = tensor * mask
+    counts = mask.sum(dim=dim)
+    return masked_tensor.sum(dim=dim) / counts
+
+
 def masked_normalize(
     tensor: torch.Tensor,
     mask: torch.Tensor,
@@ -20,9 +41,6 @@ def masked_normalize(
     Returns:
         Tensor containing the masked, normalized reduction.
     """
-    # Scaffold only:
-    # - In the real implementation, this should multiply by `mask`, reduce
-    #   along the requested dimension, and then divide by `normalize_constant`.
-    # - This helper is intentionally kept separate because future RL code can
-    #   reuse the same reduction logic.
-    raise NotImplementedError
+    mask = mask.to(dtype=tensor.dtype)
+    masked_tensor = tensor * mask
+    return masked_tensor.sum(dim=dim) / normalize_constant
