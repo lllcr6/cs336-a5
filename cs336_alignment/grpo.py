@@ -116,7 +116,10 @@ def compute_naive_policy_gradient_loss(
     weights = raw_rewards_or_advantages
     if weights.ndim == 1:
         weights = weights.unsqueeze(-1)
-    weights = weights.to(dtype=policy_log_probs.dtype).expand_as(policy_log_probs)
+    weights = weights.to(
+        device=policy_log_probs.device,
+        dtype=policy_log_probs.dtype,
+    ).expand_as(policy_log_probs)
     return -weights * policy_log_probs
 
 
@@ -139,7 +142,14 @@ def compute_grpo_clip_loss(
     """
     if advantages.ndim == 1:
         advantages = advantages.unsqueeze(-1)
-    advantages = advantages.to(dtype=policy_log_probs.dtype).expand_as(policy_log_probs)
+    advantages = advantages.to(
+        device=policy_log_probs.device,
+        dtype=policy_log_probs.dtype,
+    ).expand_as(policy_log_probs)
+    old_log_probs = old_log_probs.to(
+        device=policy_log_probs.device,
+        dtype=policy_log_probs.dtype,
+    )
 
     ratio = torch.exp(policy_log_probs - old_log_probs)
     clipped_ratio = torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
