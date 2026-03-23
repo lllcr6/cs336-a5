@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import gc
 from typing import Any, Iterator
 
 
@@ -23,8 +24,32 @@ def init_vllm(
     Yields:
         A vLLM instance.
     """
-    # TODO: instantiate vLLM with the desired runtime patches and cleanup semantics.
-    raise NotImplementedError
+    from vllm import LLM
+
+    llm = LLM(
+        model=model_id,
+        trust_remote_code=True,
+        seed=seed,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=device == "cpu",
+    )
+    try:
+        yield llm
+    finally:
+        engine = getattr(llm, "llm_engine", None)
+        if engine is not None:
+            shutdown = getattr(engine, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+        del llm
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def load_policy_into_vllm_instance(policy: Any, llm: Any) -> None:
@@ -34,8 +59,32 @@ def load_policy_into_vllm_instance(policy: Any, llm: Any) -> None:
         policy: Policy model whose weights should be copied.
         llm: Live vLLM instance that should receive the weights.
     """
-    # TODO: copy the policy weights into the underlying vLLM model.
-    raise NotImplementedError
+    state_dict = policy.state_dict()
+    model = getattr(getattr(llm, "llm_engine", None), "model_executor", None)
+    if model is None:
+        raise ValueError("Could not locate vLLM model executor on the provided instance")
+
+    target = None
+    for attr_path in [
+        ("driver_worker", "model_runner", "model"),
+        ("driver_worker", "model"),
+        ("model_runner", "model"),
+    ]:
+        obj = model
+        for attr in attr_path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None:
+            target = obj
+            break
+
+    if target is None:
+        raise ValueError("Could not locate underlying model object on vLLM instance")
+
+    target.load_state_dict(state_dict, strict=False)
+    for param in target.parameters():
+        param.requires_grad_(False)
 
 
 def build_sampling_params(
@@ -60,6 +109,16 @@ def build_sampling_params(
     Returns:
         A vLLM SamplingParams instance.
     """
-    # TODO: construct and return SamplingParams.
-    raise NotImplementedError
+    from vllm import SamplingParams
 
+    kwargs: dict[str, Any] = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "include_stop_str_in_output": include_stop_str_in_output,
+    }
+    if min_tokens is not None:
+        kwargs["min_tokens"] = min_tokens
+    if stop is not None:
+        kwargs["stop"] = stop
+    return SamplingParams(**kwargs)

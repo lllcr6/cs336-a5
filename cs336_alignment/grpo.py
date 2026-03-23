@@ -6,13 +6,16 @@ integration hooks. The actual GRPO algorithm is not implemented yet.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import EvalConfig, GRPOConfig, LossType
 from .tensor_ops import masked_mean
+from .sft import get_response_log_probs, tokenize_prompt_and_output
 
 
 def compute_group_normalized_rewards(
@@ -42,9 +45,59 @@ def compute_group_normalized_rewards(
         aggregate by prompt group, compute the chosen normalization strategy,
         and expose useful logging statistics in ``metadata``.
     """
-    # TODO: score each rollout, compute groupwise means and optional standard
-    # deviations, and return the aligned advantage tensor plus metadata.
-    raise NotImplementedError
+    if len(rollout_responses) != len(repeated_ground_truths):
+        raise ValueError("rollout_responses and repeated_ground_truths must match")
+    if group_size <= 0:
+        raise ValueError("group_size must be positive")
+    if len(rollout_responses) % group_size != 0:
+        raise ValueError("rollout count must be divisible by group_size")
+
+    reward_rows: list[dict[str, float]] = []
+    raw_reward_values: list[float] = []
+    for response, ground_truth in zip(rollout_responses, repeated_ground_truths):
+        reward_info = reward_fn(response, ground_truth)
+        reward_rows.append(reward_info)
+        raw_reward_values.append(float(reward_info.get("reward", 0.0)))
+
+    raw_rewards = torch.tensor(raw_reward_values, dtype=torch.float32)
+    advantages = torch.empty_like(raw_rewards)
+
+    num_groups = len(raw_reward_values) // group_size
+    for group_idx in range(num_groups):
+        start = group_idx * group_size
+        end = start + group_size
+        group_rewards = raw_rewards[start:end]
+        group_mean = group_rewards.mean()
+        group_advantages = group_rewards - group_mean
+        if normalize_by_std:
+            if group_rewards.numel() > 1:
+                group_std = group_rewards.std(unbiased=True)
+            else:
+                group_std = torch.zeros((), dtype=group_rewards.dtype)
+            group_advantages = group_advantages / (group_std + advantage_eps)
+        advantages[start:end] = group_advantages
+
+    metadata: dict[str, float] = {
+        "num_rollouts": float(len(raw_reward_values)),
+        "num_groups": float(num_groups),
+        "group_size": float(group_size),
+        "reward_mean": float(raw_rewards.mean().item()) if raw_rewards.numel() else 0.0,
+        "reward_std": float(raw_rewards.std(unbiased=False).item()) if raw_rewards.numel() else 0.0,
+        "reward_min": float(raw_rewards.min().item()) if raw_rewards.numel() else 0.0,
+        "reward_max": float(raw_rewards.max().item()) if raw_rewards.numel() else 0.0,
+        "advantage_mean": float(advantages.mean().item()) if advantages.numel() else 0.0,
+        "advantage_std": float(advantages.std(unbiased=False).item()) if advantages.numel() else 0.0,
+    }
+    if reward_rows:
+        for key in sorted(reward_rows[0].keys()):
+            values = torch.tensor(
+                [float(row.get(key, 0.0)) for row in reward_rows],
+                dtype=torch.float32,
+            )
+            metadata[f"{key}_mean"] = float(values.mean().item())
+            metadata[f"{key}_std"] = float(values.std(unbiased=False).item())
+
+    return advantages, raw_rewards, metadata
 
 
 def compute_naive_policy_gradient_loss(
@@ -60,9 +113,11 @@ def compute_naive_policy_gradient_loss(
     Returns:
         Per-token loss tensor with the same shape as ``policy_log_probs``.
     """
-    # TODO: broadcast rewards/advantages across the token dimension and form
-    # the negative policy-gradient surrogate loss.
-    raise NotImplementedError
+    weights = raw_rewards_or_advantages
+    if weights.ndim == 1:
+        weights = weights.unsqueeze(-1)
+    weights = weights.to(dtype=policy_log_probs.dtype).expand_as(policy_log_probs)
+    return -weights * policy_log_probs
 
 
 def compute_grpo_clip_loss(
@@ -82,9 +137,28 @@ def compute_grpo_clip_loss(
     Returns:
         Tuple of the per-token loss tensor and auxiliary metadata.
     """
-    # TODO: build the importance-sampling ratio, compare unclipped vs clipped
-    # objectives, and surface clipping indicators for logging.
-    raise NotImplementedError
+    if advantages.ndim == 1:
+        advantages = advantages.unsqueeze(-1)
+    advantages = advantages.to(dtype=policy_log_probs.dtype).expand_as(policy_log_probs)
+
+    ratio = torch.exp(policy_log_probs - old_log_probs)
+    clipped_ratio = torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+    unclipped_objective = ratio * advantages
+    clipped_objective = clipped_ratio * advantages
+    objective = torch.minimum(unclipped_objective, clipped_objective)
+    loss = -objective
+
+    clip_mask = (ratio < (1.0 - cliprange)) | (ratio > (1.0 + cliprange))
+    metadata = {
+        "ratio_mean": ratio.mean().detach(),
+        "ratio_std": ratio.std(unbiased=False).detach(),
+        "ratio_min": ratio.min().detach(),
+        "ratio_max": ratio.max().detach(),
+        "clip_fraction": clip_mask.float().mean().detach(),
+        "approx_kl": (old_log_probs - policy_log_probs).mean().detach(),
+        "objective_mean": objective.mean().detach(),
+    }
+    return loss, metadata
 
 
 def compute_policy_gradient_loss(
@@ -108,9 +182,40 @@ def compute_policy_gradient_loss(
     Returns:
         Tuple of unreduced per-token loss and logging metadata.
     """
-    # TODO: validate required inputs for the chosen loss type and delegate to
-    # the correct primitive, combining metadata into one dictionary.
-    raise NotImplementedError
+    if loss_type == "no_baseline":
+        if raw_rewards is None:
+            raise ValueError("raw_rewards is required for no_baseline loss")
+        return compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs), {
+            "raw_reward_mean": raw_rewards.mean().detach(),
+            "raw_reward_std": raw_rewards.std(unbiased=False).detach(),
+        }
+
+    if loss_type == "reinforce_with_baseline":
+        if advantages is None:
+            raise ValueError("advantages is required for reinforce_with_baseline loss")
+        return compute_naive_policy_gradient_loss(advantages, policy_log_probs), {
+            "advantage_mean": advantages.mean().detach(),
+            "advantage_std": advantages.std(unbiased=False).detach(),
+        }
+
+    if loss_type == "grpo_clip":
+        if advantages is None:
+            raise ValueError("advantages is required for grpo_clip loss")
+        if old_log_probs is None:
+            raise ValueError("old_log_probs is required for grpo_clip loss")
+        if cliprange is None:
+            raise ValueError("cliprange is required for grpo_clip loss")
+        loss, metadata = compute_grpo_clip_loss(
+            advantages=advantages,
+            policy_log_probs=policy_log_probs,
+            old_log_probs=old_log_probs,
+            cliprange=cliprange,
+        )
+        metadata["advantage_mean"] = advantages.mean().detach()
+        metadata["advantage_std"] = advantages.std(unbiased=False).detach()
+        return loss, metadata
+
+    raise ValueError(f"Unsupported loss_type: {loss_type}")
 
 
 def grpo_microbatch_train_step(
@@ -143,21 +248,37 @@ def grpo_microbatch_train_step(
         response mask with ``masked_mean``, scale for gradient accumulation,
         and call ``loss.backward()``.
     """
-    # TODO: compute the unreduced per-token GRPO loss, reduce over masked
-    # response tokens, scale for accumulation, and backpropagate the scalar.
-    raise NotImplementedError
+    unreduced_loss, metadata = compute_policy_gradient_loss(
+        policy_log_probs=policy_log_probs,
+        loss_type=loss_type,
+        raw_rewards=raw_rewards,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
+    per_example_loss = masked_mean(unreduced_loss, response_mask, dim=1)
+    loss = per_example_loss.mean() / gradient_accumulation_steps
+    loss.backward()
+
+    metadata = dict(metadata)
+    metadata.update(
+        {
+            "microbatch_loss": loss.detach(),
+            "response_token_count": response_mask.sum().detach(),
+            "masked_loss_mean": per_example_loss.mean().detach(),
+        }
+    )
+    return loss, metadata
 
 
 def should_save_checkpoint(step: int, save_every_steps: int) -> bool:
     """Return whether GRPO should persist a checkpoint at ``step``."""
-    # TODO: implement the step-based save cadence used by the training loop.
-    raise NotImplementedError
+    return save_every_steps > 0 and step > 0 and step % save_every_steps == 0
 
 
 def should_run_evaluation(step: int, eval_every_steps: int) -> bool:
     """Return whether GRPO should trigger evaluation at ``step``."""
-    # TODO: implement the shared step-based evaluation cadence for GRPO runs.
-    raise NotImplementedError
+    return eval_every_steps > 0 and step > 0 and step % eval_every_steps == 0
 
 
 def should_refresh_old_log_probs(
@@ -165,9 +286,7 @@ def should_refresh_old_log_probs(
     epochs_per_rollout_batch: int,
 ) -> bool:
     """Return whether off-policy state should refresh cached old log-probs."""
-    # TODO: define when the rollout policy state should be re-scored and cached
-    # before running another block of off-policy optimization steps.
-    raise NotImplementedError
+    return epochs_per_rollout_batch > 0 and (step - 1) % epochs_per_rollout_batch == 0
 
 
 def build_grpo_run_name(
@@ -177,15 +296,19 @@ def build_grpo_run_name(
     train_batch_size: int,
 ) -> str:
     """Build a descriptive W&B run name for a GRPO training job."""
-    # TODO: fold the key GRPO hyperparameters into a stable run name.
-    raise NotImplementedError
+    return (
+        f"{base_name}-grpo-{loss_type}"
+        f"-roll{rollout_batch_size}"
+        f"-train{train_batch_size}"
+    )
 
 
 def resolve_grpo_output_dir(config: GRPOConfig) -> Path:
     """Resolve the canonical local checkpoint/output directory for GRPO."""
-    # TODO: combine checkpoint settings and run metadata into the effective
-    # output directory used by local checkpoints and Drive mirroring.
-    raise NotImplementedError
+    output_dir = Path(config.checkpoint.output_dir)
+    if config.wandb.run_name:
+        return output_dir / config.wandb.run_name
+    return output_dir
 
 
 def log_grpo_metrics(
@@ -195,9 +318,24 @@ def log_grpo_metrics(
     config: GRPOConfig,
 ) -> None:
     """Placeholder hook for W&B metric logging during GRPO training."""
-    # TODO: format and emit GRPO train/eval metrics, including reward stats,
-    # entropy, response length, gradient norm, and clip fraction when present.
-    raise NotImplementedError
+    try:
+        import wandb  # type: ignore
+    except Exception:
+        return
+
+    if getattr(wandb, "run", None) is None:
+        return
+
+    payload: dict[str, Any] = {"step": step}
+    for key, value in metrics.items():
+        if isinstance(value, torch.Tensor):
+            payload[key] = float(value.detach().mean().cpu().item())
+        elif isinstance(value, (int, float)):
+            payload[key] = float(value)
+        else:
+            payload[key] = value
+
+    wandb.log(payload, step=step)
 
 
 def run_grpo_training(
@@ -228,6 +366,209 @@ def run_grpo_training(
         and advantages, optionally refresh old log-probs, optimize the policy,
         log to W&B, save checkpoints frequently, and mirror artifacts to Drive.
     """
-    # TODO: load policy and generation backends, execute the rollout/optimize
-    # loop from the assignment, and connect logging/checkpoint hooks.
-    raise NotImplementedError
+    from .checkpointing import save_checkpoint, sync_checkpoint_to_drive
+    from .data import read_jsonl_dataset
+
+    del validation_dataset_path
+
+    output_dir = resolve_grpo_output_dir(config)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if config.train_steps <= 0:
+        return {
+            "model_id": model_id,
+            "output_dir": str(output_dir),
+            "checkpoint_path": None,
+            "steps": 0,
+            "loss": None,
+            "loss_history": [],
+        }
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForCausalLM.from_pretrained(model_id)
+    model.to(device)
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+
+    train_records = read_jsonl_dataset(train_dataset_path)
+    if not train_records:
+        return {
+            "model_id": model_id,
+            "output_dir": str(output_dir),
+            "checkpoint_path": None,
+            "steps": 0,
+            "loss": None,
+            "loss_history": [],
+        }
+
+    group_size = max(1, config.group_size)
+    rollout_batch_size = max(group_size, config.rollout_batch_size, config.train_batch_size, 1)
+    prompt_batch_size = max(1, rollout_batch_size // group_size)
+    epochs_per_rollout_batch = max(1, config.epochs_per_rollout_batch)
+
+    def _prompt_from_record(record: dict[str, Any]) -> str:
+        prompt = record.get("prompt")
+        if prompt is None:
+            prompt = record.get("question")
+        if prompt is None:
+            raise ValueError("Each GRPO record must contain a prompt or question")
+        return str(prompt)
+
+    def _ground_truth_from_record(record: dict[str, Any]) -> str:
+        ground_truth = record.get("ground_truth")
+        if ground_truth is None:
+            ground_truth = record.get("answer")
+        if ground_truth is None:
+            ground_truth = record.get("response")
+        if ground_truth is None:
+            raise ValueError("Each GRPO record must contain a ground truth or answer")
+        return str(ground_truth)
+
+    def _generate_response(prompt: str) -> str:
+        inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                do_sample=True,
+                temperature=(eval_config.temperature if eval_config else 1.0),
+                top_p=(eval_config.top_p if eval_config else 1.0),
+                max_new_tokens=(eval_config.max_tokens if eval_config else 64),
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+        return tokenizer.decode(
+            generated[0][inputs["input_ids"].shape[-1] :],
+            skip_special_tokens=True,
+        )
+
+    losses: list[float] = []
+    cache: dict[str, Any] | None = None
+    for step in range(1, config.train_steps + 1):
+        if cache is None or should_refresh_old_log_probs(step, epochs_per_rollout_batch):
+            start = ((step - 1) * prompt_batch_size) % len(train_records)
+            batch_records = [
+                train_records[(start + idx) % len(train_records)]
+                for idx in range(prompt_batch_size)
+            ]
+
+            prompts: list[str] = []
+            rollout_responses: list[str] = []
+            repeated_ground_truths: list[str] = []
+            for record in batch_records:
+                prompt = _prompt_from_record(record)
+                ground_truth = _ground_truth_from_record(record)
+                for _ in range(group_size):
+                    prompts.append(prompt)
+                    rollout_responses.append(_generate_response(prompt))
+                    repeated_ground_truths.append(ground_truth)
+
+            advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
+                reward_fn=reward_fn,
+                rollout_responses=rollout_responses,
+                repeated_ground_truths=repeated_ground_truths,
+                group_size=group_size,
+                advantage_eps=config.advantage_eps,
+                normalize_by_std=config.normalize_by_std,
+            )
+
+            tokenized = tokenize_prompt_and_output(prompts, rollout_responses, tokenizer)
+            tokenized = {k: v.to(device) for k, v in tokenized.items()}
+            with torch.no_grad():
+                rollout_log_probs = get_response_log_probs(
+                    model=model,
+                    input_ids=tokenized["input_ids"],
+                    labels=tokenized["labels"],
+                    return_token_entropy=False,
+                )["log_probs"]
+
+            cache = {
+                "tokenized": tokenized,
+                "raw_rewards": raw_rewards.unsqueeze(-1),
+                "advantages": advantages.unsqueeze(-1),
+                "old_log_probs": rollout_log_probs.detach(),
+                "reward_metadata": reward_metadata,
+            }
+
+        optimizer.zero_grad(set_to_none=True)
+        current_log_probs = get_response_log_probs(
+            model=model,
+            input_ids=cache["tokenized"]["input_ids"],
+            labels=cache["tokenized"]["labels"],
+            return_token_entropy=False,
+        )["log_probs"]
+        loss, loss_metadata = grpo_microbatch_train_step(
+            policy_log_probs=current_log_probs,
+            response_mask=cache["tokenized"]["response_mask"],
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            loss_type=config.loss_type,
+            raw_rewards=cache["raw_rewards"] if config.loss_type == "no_baseline" else None,
+            advantages=cache["advantages"] if config.loss_type != "no_baseline" else None,
+            old_log_probs=cache["old_log_probs"] if config.loss_type == "grpo_clip" else None,
+            cliprange=config.cliprange,
+        )
+        if config.clip_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
+        optimizer.step()
+
+        losses.append(float(loss.detach().cpu()))
+        log_grpo_metrics(
+            step=step,
+            metrics={**cache["reward_metadata"], **loss_metadata},
+            config=config,
+        )
+
+        if should_save_checkpoint(step, config.save_every_steps):
+            checkpoint_path = save_checkpoint(
+                output_dir,
+                state={
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "step": step,
+                    "loss_history": losses,
+                    "config": asdict(config),
+                },
+                step=step,
+                max_checkpoints=config.checkpoint.max_checkpoints,
+            )
+            if config.drive_sync.enabled and config.drive_sync.drive_root is not None:
+                drive_dir = (
+                    Path(config.drive_sync.drive_root)
+                    / config.drive_sync.per_run_subdir
+                    / config.drive_sync.checkpoint_dirname
+                )
+                drive_dir.mkdir(parents=True, exist_ok=True)
+                sync_checkpoint_to_drive(checkpoint_path, drive_dir)
+
+    final_checkpoint = save_checkpoint(
+        output_dir,
+        state={
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "step": config.train_steps,
+            "loss_history": losses,
+            "config": asdict(config),
+        },
+        step=config.train_steps,
+        max_checkpoints=config.checkpoint.max_checkpoints,
+    )
+    if config.drive_sync.enabled and config.drive_sync.drive_root is not None:
+        drive_dir = (
+            Path(config.drive_sync.drive_root)
+            / config.drive_sync.per_run_subdir
+            / config.drive_sync.checkpoint_dirname
+        )
+        drive_dir.mkdir(parents=True, exist_ok=True)
+        sync_checkpoint_to_drive(final_checkpoint, drive_dir)
+
+    return {
+        "model_id": model_id,
+        "output_dir": str(output_dir),
+        "checkpoint_path": str(final_checkpoint),
+        "steps": config.train_steps,
+        "loss": losses[-1] if losses else None,
+        "loss_history": losses,
+    }
