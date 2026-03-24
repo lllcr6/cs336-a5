@@ -44,7 +44,12 @@ def _summarize_rewards(reward_info: list[dict[str, float]]) -> dict[str, float]:
     for key in keys:
         values = [item[key] for item in reward_info if key in item]
         if values:
+            summary[key] = float(mean(values))
             summary[f"mean_{key}"] = float(mean(values))
+    if "answer_reward" in summary:
+        summary["reward_mean"] = summary["answer_reward"]
+    elif "reward" in summary:
+        summary["reward_mean"] = summary["reward"]
     return summary
 
 
@@ -142,7 +147,12 @@ def log_generations(
         for key in keys:
             values = [item[key] for item in reward_info if key in item]
             if values:
+                summary[key] = float(mean(values))
                 summary[f"mean_{key}"] = float(mean(values))
+        if "answer_reward" in summary:
+            summary["reward_mean"] = summary["answer_reward"]
+        elif "reward" in summary:
+            summary["reward_mean"] = summary["reward"]
 
     payload = {
         "prompts": prompts,

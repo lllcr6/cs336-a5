@@ -16,7 +16,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import EvalConfig, GRPOConfig, LossType
 from .tensor_ops import masked_mean
-from .sft import get_response_log_probs, tokenize_prompt_and_output
+from .sft import (
+    _evaluate_sft_generation_validation,
+    get_response_log_probs,
+    tokenize_prompt_and_output,
+)
 
 
 def compute_group_normalized_rewards(
@@ -95,6 +99,7 @@ def compute_group_normalized_rewards(
                 [float(row.get(key, 0.0)) for row in reward_rows],
                 dtype=torch.float32,
             )
+            metadata[key] = float(values.mean().item())
             metadata[f"{key}_mean"] = float(values.mean().item())
             metadata[f"{key}_std"] = float(values.std(unbiased=False).item())
 
@@ -381,7 +386,13 @@ def log_grpo_metrics(
 ) -> None:
     """Placeholder hook for W&B metric logging during GRPO training."""
     del config
-    _log_wandb_metrics(step, metrics, prefix="train/")
+    # Keep the headline W&B payload reward-centered. Loss terms remain part of
+    # the returned training state, but they are not the main reported signal.
+    debug_only_keys = {"loss", "microbatch_loss", "masked_loss_mean"}
+    filtered_metrics = {
+        key: value for key, value in metrics.items() if key not in debug_only_keys
+    }
+    _log_wandb_metrics(step, filtered_metrics, prefix="train/")
 
 
 def _record_prompt(record: dict[str, Any]) -> str:
@@ -626,12 +637,13 @@ def run_grpo_training(
             }
 
         optimizer.zero_grad(set_to_none=True)
-        current_log_probs = get_response_log_probs(
+        current_outputs = get_response_log_probs(
             model=model,
             input_ids=cache["tokenized"]["input_ids"],
             labels=cache["tokenized"]["labels"],
-            return_token_entropy=False,
-        )["log_probs"]
+            return_token_entropy=True,
+        )
+        current_log_probs = current_outputs["log_probs"]
         loss, loss_metadata = grpo_microbatch_train_step(
             policy_log_probs=current_log_probs,
             response_mask=cache["tokenized"]["response_mask"],
@@ -642,14 +654,29 @@ def run_grpo_training(
             old_log_probs=cache["old_log_probs"] if config.loss_type == "grpo_clip" else None,
             cliprange=config.cliprange,
         )
+        train_token_entropy = masked_mean(
+            current_outputs["token_entropy"],
+            cache["tokenized"]["response_mask"],
+            dim=1,
+        ).mean()
+        train_response_length = cache["tokenized"]["response_mask"].sum(dim=1).float().mean()
         if config.clip_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
+        else:
+            grads = [
+                parameter.grad.detach().norm(2)
+                for parameter in model.parameters()
+                if parameter.grad is not None
+            ]
+            grad_norm = torch.linalg.vector_norm(torch.stack(grads), ord=2) if grads else torch.tensor(0.0, device=device)
         optimizer.step()
 
         losses.append(float(loss.detach().cpu()))
         train_metrics = {
-            "loss": loss.detach(),
             "learning_rate": optimizer.param_groups[0]["lr"],
+            "token_entropy": train_token_entropy.detach(),
+            "response_length": train_response_length.detach(),
+            "grad_norm": grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
             **cache["reward_metadata"],
             **loss_metadata,
         }
@@ -659,13 +686,19 @@ def run_grpo_training(
         if validation_records and (
             should_run_evaluation(step, config.eval_every_steps) or step == config.train_steps
         ):
-            validation_metrics = _evaluate_grpo_validation(
+            validation_output_dir = None
+            if eval_config is not None and eval_config.output_dir is not None:
+                validation_output_dir = Path(eval_config.output_dir) / f"step-{step}"
+            validation_metrics = _evaluate_sft_generation_validation(
                 model=model,
                 tokenizer=tokenizer,
                 validation_records=validation_records,
                 reward_fn=reward_fn,
                 device=device,
-                eval_config=eval_config,
+                temperature=eval_config.temperature if eval_config is not None else 1.0,
+                top_p=eval_config.top_p if eval_config is not None else 1.0,
+                max_tokens=eval_config.max_tokens if eval_config is not None else 64,
+                eval_output_dir=validation_output_dir,
             )
             _log_wandb_metrics(step, validation_metrics, prefix="eval/")
 

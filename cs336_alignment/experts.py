@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tempfile
 from typing import Any, Callable
 
 import torch
 
-from .config import ExpertIterationConfig
+from .config import CheckpointConfig, DriveSyncConfig, EvalConfig, ExpertIterationConfig, SFTConfig
 from .evaluation import evaluate_vllm, log_generations
 from .vllm_utils import build_sampling_params, init_vllm
+from .sft import run_sft_training
 
 
 def _load_jsonl_records(path: str | Path) -> list[dict[str, Any]]:
@@ -106,6 +108,7 @@ def run_expert_iteration(
                 responses=train_results["responses"],
                 rewards=train_results["reward_info"],
             )
+            keep_rate = len(selected) / max(len(train_results["responses"]), 1)
             for ground_truth, reward_info in zip(
                 train_results["ground_truths"], train_results["reward_info"]
             ):
@@ -119,6 +122,46 @@ def run_expert_iteration(
                     )
             accumulated_dataset.extend(selected)
 
+            sft_update_result: dict[str, Any] = {}
+            with tempfile.TemporaryDirectory(prefix="ei-sft-") as tmpdir:
+                tmpdir_path = Path(tmpdir)
+                sft_dataset_path = tmpdir_path / "sft_dataset.jsonl"
+                with open(sft_dataset_path, "w", encoding="utf-8") as f:
+                    for example in selected:
+                        f.write(json.dumps(example, ensure_ascii=False) + "\n")
+
+                sft_train_steps = max(1, config.sft_epochs_per_round) * max(1, len(selected))
+                sft_update_result = run_sft_training(
+                    model_id=model_id,
+                    dataset_path=sft_dataset_path,
+                    validation_dataset_path=validation_dataset_path,
+                    config=SFTConfig(
+                        train_steps=sft_train_steps,
+                        learning_rate=1e-5,
+                        train_batch_size=max(1, min(len(selected) or 1, config.rollout_batch_size or 1)),
+                        gradient_accumulation_steps=1,
+                        normalize_constant=1.0,
+                        eval_every_steps=config.eval_every_steps,
+                        save_every_steps=config.save_every_steps,
+                        wandb=config.wandb,
+                        checkpoint=CheckpointConfig(
+                            output_dir=tmpdir_path / "checkpoints",
+                            save_every_steps=0,
+                            max_checkpoints=1,
+                            resume_from_checkpoint=None,
+                        ),
+                        drive_sync=DriveSyncConfig(enabled=False),
+                    ),
+                    eval_config=EvalConfig(
+                        output_dir=tmpdir_path / "eval",
+                        batch_size=1,
+                        temperature=0.0,
+                        top_p=1.0,
+                        max_tokens=512,
+                    ),
+                    reward_fn=reward_fn,
+                )
+
             rounds.append(
                 {
                     "round": round_idx,
@@ -126,6 +169,12 @@ def run_expert_iteration(
                     "validation_summary": validation_results["summary"],
                     "selected_examples": len(selected),
                     "accumulated_examples": len(accumulated_dataset),
+                    "filter_keep_rate": keep_rate,
+                    "sft_update": {
+                        "steps": sft_update_result.get("steps", 0),
+                        "loss": sft_update_result.get("loss"),
+                        "loss_history": sft_update_result.get("loss_history", []),
+                    },
                 }
             )
 

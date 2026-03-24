@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import random
 
 import torch
@@ -17,6 +17,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import PreTrainedTokenizerBase
 
 from .config import EvalConfig, SFTConfig
+from .evaluation import log_generations
+from .tensor_ops import masked_mean
 
 
 def tokenize_prompt_and_output(
@@ -107,6 +109,11 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     log_probs = torch.log_softmax(logits, dim=-1)
     probs = log_probs.exp()
     return -(probs * log_probs).sum(dim=-1)
+
+
+def _aggregate_masked_metric(values: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """Average a token-level metric over response tokens only."""
+    return masked_mean(values, response_mask, dim=1)
 
 
 def get_response_log_probs(
@@ -241,6 +248,17 @@ def _record_response(record: dict[str, Any]) -> str:
     return str(response)
 
 
+def _record_ground_truth(record: dict[str, Any]) -> str:
+    ground_truth = record.get("ground_truth")
+    if ground_truth is None:
+        ground_truth = record.get("answer")
+    if ground_truth is None:
+        ground_truth = record.get("response")
+    if ground_truth is None:
+        raise ValueError("Each SFT record must contain a ground truth/answer")
+    return str(ground_truth)
+
+
 def _evaluate_sft_validation(
     *,
     model: torch.nn.Module,
@@ -256,6 +274,7 @@ def _evaluate_sft_validation(
     model.eval()
     total_loss = 0.0
     total_token_count = 0.0
+    total_token_entropy = 0.0
     total_examples = 0.0
     num_batches = 0.0
     with torch.no_grad():
@@ -270,19 +289,23 @@ def _evaluate_sft_validation(
                 model=model,
                 input_ids=batch["input_ids"],
                 labels=batch["labels"],
-                return_token_entropy=False,
+                return_token_entropy=True,
             )
             token_log_probs = outputs["log_probs"]
+            token_entropy = outputs["token_entropy"]
             response_mask = batch["response_mask"]
             token_count = float(response_mask.sum().item())
             batch_loss = float((-(token_log_probs * response_mask).sum().item()) / max(normalize_constant, 1e-12))
+            batch_entropy = float(_aggregate_masked_metric(token_entropy, response_mask).mean().item())
             total_loss += batch_loss
             total_token_count += token_count
+            total_token_entropy += batch_entropy
             total_examples += float(len(batch_records))
             num_batches += 1.0
 
     avg_loss = total_loss / max(num_batches, 1.0)
     avg_token_loss = total_loss / max(total_token_count, 1.0)
+    avg_token_entropy = total_token_entropy / max(num_batches, 1.0)
     perplexity = math.exp(avg_token_loss) if avg_token_loss < 50 else float("inf")
 
     model.train()
@@ -291,9 +314,105 @@ def _evaluate_sft_validation(
         "eval/num_batches": num_batches,
         "eval/loss": avg_loss,
         "eval/token_loss": avg_token_loss,
+        "eval/token_entropy": avg_token_entropy,
         "eval/perplexity": perplexity,
         "eval/response_token_count": total_token_count,
     }
+
+
+def _evaluate_sft_generation_validation(
+    *,
+    model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    validation_records: list[dict[str, Any]],
+    device: torch.device,
+    reward_fn: Callable[[str, str], dict[str, float]] | None,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    eval_output_dir: Path | None = None,
+) -> dict[str, float]:
+    if not validation_records:
+        return {"eval/num_examples": 0.0}
+    if reward_fn is None:
+        return {"eval/num_examples": float(len(validation_records))}
+
+    prompts: list[str] = []
+    responses: list[str] = []
+    ground_truths: list[str] = []
+    reward_info: list[dict[str, float]] = []
+    response_lengths: list[float] = []
+    token_entropies: list[float] = []
+
+    model.eval()
+    with torch.no_grad():
+        for record in validation_records:
+            prompt = _record_prompt(record)
+            ground_truth = _record_ground_truth(record)
+            inputs = tokenizer(prompt, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            do_sample = temperature > 0.0
+            generate_kwargs: dict[str, Any] = {
+                "do_sample": do_sample,
+                "top_p": top_p,
+                "max_new_tokens": max_tokens,
+                "pad_token_id": tokenizer.pad_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+            }
+            if do_sample:
+                generate_kwargs["temperature"] = temperature
+            generated = model.generate(
+                **inputs,
+                **generate_kwargs,
+            )
+            response = tokenizer.decode(
+                generated[0][inputs["input_ids"].shape[-1] :],
+                skip_special_tokens=True,
+            )
+            tokenized = tokenize_prompt_and_output([prompt], [response], tokenizer)
+            tokenized = {k: v.to(device) for k, v in tokenized.items()}
+            outputs = get_response_log_probs(
+                model=model,
+                input_ids=tokenized["input_ids"],
+                labels=tokenized["labels"],
+                return_token_entropy=True,
+            )
+
+            prompts.append(prompt)
+            responses.append(response)
+            ground_truths.append(ground_truth)
+            reward_info.append(reward_fn(response, ground_truth))
+            response_lengths.append(float(generated[0].shape[-1] - inputs["input_ids"].shape[-1]))
+            token_entropies.append(
+                float(_aggregate_masked_metric(outputs["token_entropy"], tokenized["response_mask"]).mean().item())
+            )
+
+    summary: dict[str, float] = {
+        "eval/num_examples": float(len(validation_records)),
+        "eval/response_length": float(sum(response_lengths) / max(len(response_lengths), 1)),
+        "eval/token_entropy": float(sum(token_entropies) / max(len(token_entropies), 1)),
+    }
+    keys = sorted({key for row in reward_info for key in row})
+    for key in keys:
+        values = torch.tensor([float(row.get(key, 0.0)) for row in reward_info], dtype=torch.float32)
+        summary[f"eval/{key}"] = float(values.mean().item())
+        summary[f"eval/{key}_mean"] = float(values.mean().item())
+    if "answer_reward" in keys:
+        summary["eval/reward_mean"] = summary["eval/answer_reward"]
+    elif "reward" in keys:
+        summary["eval/reward_mean"] = summary["eval/reward"]
+
+    if eval_output_dir is not None:
+        log_generations(
+            prompts=prompts,
+            responses=responses,
+            ground_truths=ground_truths,
+            reward_info=reward_info,
+            output_dir=eval_output_dir,
+        )
+
+    model.train()
+    return summary
 
 
 def sft_microbatch_train_step(
@@ -369,6 +488,7 @@ def run_sft_training(
     validation_dataset_path: str | Path | None,
     config: SFTConfig,
     eval_config: EvalConfig | None = None,
+    reward_fn: Callable[[str, str], dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     """Scaffold entrypoint for full SFT training.
 
@@ -458,7 +578,7 @@ def run_sft_training(
                 model=model,
                 input_ids=batch["input_ids"],
                 labels=batch["labels"],
-                return_token_entropy=False,
+                return_token_entropy=True,
             )
             loss, metadata = sft_microbatch_train_step(
                 policy_log_probs=outputs["log_probs"],
@@ -466,8 +586,23 @@ def run_sft_training(
                 gradient_accumulation_steps=config.gradient_accumulation_steps,
                 normalize_constant=config.normalize_constant,
             )
+            train_token_entropy = _aggregate_masked_metric(
+                outputs["token_entropy"], batch["response_mask"]
+            ).mean()
             if config.clip_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config.clip_grad_norm
+                )
+            else:
+                grads = [
+                    parameter.grad.detach().norm(2)
+                    for parameter in model.parameters()
+                    if parameter.grad is not None
+                ]
+                grad_norm = torch.linalg.vector_norm(torch.stack(grads), ord=2) if grads else torch.tensor(0.0, device=device)
+            metadata = dict(metadata)
+            metadata["token_entropy"] = train_token_entropy.detach()
+            metadata["grad_norm"] = grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
             step += 1
@@ -485,6 +620,8 @@ def run_sft_training(
                     (-metadata["response_log_prob_sum"])
                     / metadata["response_token_count"].clamp_min(1)
                 ),
+                "token_entropy": train_token_entropy.detach(),
+                "grad_norm": grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
                 "learning_rate": optimizer.param_groups[0]["lr"],
             }
             if step % max(1, config.log_every_steps) == 0 or step == 1 or step == config.train_steps:
@@ -501,6 +638,23 @@ def run_sft_training(
                     batch_size=config.train_batch_size,
                     normalize_constant=config.normalize_constant,
                 )
+                if reward_fn is not None:
+                    validation_output_dir = None
+                    if eval_config is not None and eval_config.output_dir is not None:
+                        validation_output_dir = Path(eval_config.output_dir) / f"step-{step}"
+                    validation_metrics.update(
+                        _evaluate_sft_generation_validation(
+                            model=model,
+                            tokenizer=tokenizer,
+                            validation_records=validation_records,
+                            device=device,
+                            reward_fn=reward_fn,
+                            temperature=eval_config.temperature if eval_config is not None else 0.0,
+                            top_p=eval_config.top_p if eval_config is not None else 1.0,
+                            max_tokens=eval_config.max_tokens if eval_config is not None else 64,
+                            eval_output_dir=validation_output_dir,
+                        )
+                    )
                 _log_wandb_metrics(step, validation_metrics, prefix="eval/")
 
             if should_save_checkpoint(step, config.save_every_steps):
