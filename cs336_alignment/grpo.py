@@ -7,6 +7,7 @@ integration hooks. The actual GRPO algorithm is not implemented yet.
 from __future__ import annotations
 
 from dataclasses import asdict
+import math
 from pathlib import Path
 from typing import Any, Callable
 
@@ -321,13 +322,32 @@ def resolve_grpo_output_dir(config: GRPOConfig) -> Path:
     return output_dir
 
 
-def log_grpo_metrics(
-    *,
-    step: int,
-    metrics: dict[str, Any],
-    config: GRPOConfig,
-) -> None:
-    """Placeholder hook for W&B metric logging during GRPO training."""
+def _maybe_init_wandb(config: GRPOConfig) -> Any | None:
+    try:
+        import wandb  # type: ignore
+    except Exception:
+        return None
+
+    if getattr(wandb, "run", None) is not None:
+        return wandb
+
+    init_kwargs: dict[str, Any] = {
+        "project": config.wandb.project,
+        "entity": config.wandb.entity,
+        "name": config.wandb.run_name,
+        "tags": config.wandb.tags,
+    }
+    if config.wandb.log_dir is not None:
+        init_kwargs["dir"] = str(config.wandb.log_dir)
+
+    try:
+        wandb.init(**{k: v for k, v in init_kwargs.items() if v is not None})
+    except Exception:
+        return None
+    return wandb
+
+
+def _log_wandb_metrics(step: int, metrics: dict[str, Any], *, prefix: str = "train/") -> None:
     try:
         import wandb  # type: ignore
     except Exception:
@@ -338,18 +358,114 @@ def log_grpo_metrics(
 
     payload: dict[str, Any] = {"step": step}
     for key, value in metrics.items():
+        metric_name = key if key.startswith(("train/", "eval/", "val/", "step")) else f"{prefix}{key}"
         if isinstance(value, torch.Tensor):
             detached = value.detach()
             if detached.dtype.is_floating_point or detached.dtype.is_complex:
-                payload[key] = float(detached.mean().cpu().item())
+                payload[metric_name] = float(detached.mean().cpu().item())
             else:
-                payload[key] = int(detached.sum().cpu().item())
+                payload[metric_name] = int(detached.sum().cpu().item())
         elif isinstance(value, (int, float)):
-            payload[key] = float(value)
+            payload[metric_name] = float(value)
         else:
-            payload[key] = value
+            payload[metric_name] = value
 
     wandb.log(payload, step=step)
+
+
+def log_grpo_metrics(
+    *,
+    step: int,
+    metrics: dict[str, Any],
+    config: GRPOConfig,
+) -> None:
+    """Placeholder hook for W&B metric logging during GRPO training."""
+    del config
+    _log_wandb_metrics(step, metrics, prefix="train/")
+
+
+def _record_prompt(record: dict[str, Any]) -> str:
+    prompt = record.get("prompt")
+    if prompt is None:
+        prompt = record.get("question")
+    if prompt is None:
+        raise ValueError("Each GRPO record must contain a prompt or question")
+    return str(prompt)
+
+
+def _record_ground_truth(record: dict[str, Any]) -> str:
+    ground_truth = record.get("ground_truth")
+    if ground_truth is None:
+        ground_truth = record.get("answer")
+    if ground_truth is None:
+        ground_truth = record.get("response")
+    if ground_truth is None:
+        raise ValueError("Each GRPO record must contain a ground truth or answer")
+    return str(ground_truth)
+
+
+def _evaluate_grpo_validation(
+    *,
+    model: torch.nn.Module,
+    tokenizer: Any,
+    validation_records: list[dict[str, Any]],
+    reward_fn: Callable[[str, str], dict[str, float]],
+    device: torch.device,
+    eval_config: EvalConfig | None,
+) -> dict[str, float]:
+    if not validation_records:
+        return {"eval/num_examples": 0.0}
+
+    total_rewards: list[float] = []
+    reward_rows: list[dict[str, float]] = []
+    answered = 0.0
+    max_new_tokens = eval_config.max_tokens if eval_config is not None else 64
+    temperature = eval_config.temperature if eval_config is not None else 1.0
+    top_p = eval_config.top_p if eval_config is not None else 1.0
+
+    model.eval()
+    with torch.no_grad():
+        for record in validation_records:
+            prompt = _record_prompt(record)
+            ground_truth = _record_ground_truth(record)
+            inputs = tokenizer(prompt, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            generated = model.generate(
+                **inputs,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            response = tokenizer.decode(
+                generated[0][inputs["input_ids"].shape[-1] :],
+                skip_special_tokens=True,
+            )
+            reward_info = reward_fn(response, ground_truth)
+            reward_rows.append(reward_info)
+            reward = float(reward_info.get("reward", reward_info.get("answer_reward", 0.0)))
+            total_rewards.append(reward)
+            answered += 1.0 if reward > 0.0 else 0.0
+
+    reward_tensor = torch.tensor(total_rewards, dtype=torch.float32)
+    summary: dict[str, float] = {
+        "eval/num_examples": float(len(validation_records)),
+        "eval/reward_mean": float(reward_tensor.mean().item()),
+        "eval/reward_std": float(reward_tensor.std(unbiased=False).item()) if reward_tensor.numel() > 1 else 0.0,
+        "eval/reward_min": float(reward_tensor.min().item()),
+        "eval/reward_max": float(reward_tensor.max().item()),
+        "eval/pass_rate": answered / max(float(len(validation_records)), 1.0),
+    }
+    keys = sorted({key for row in reward_rows for key in row})
+    for key in keys:
+        values = torch.tensor([float(row.get(key, 0.0)) for row in reward_rows], dtype=torch.float32)
+        summary[f"eval/{key}_mean"] = float(values.mean().item())
+        summary[f"eval/{key}_std"] = float(values.std(unbiased=False).item()) if values.numel() > 1 else 0.0
+
+    model.train()
+    return summary
 
 
 def run_grpo_training(
@@ -383,10 +499,9 @@ def run_grpo_training(
     from .checkpointing import save_checkpoint, sync_checkpoint_to_drive
     from .data import read_jsonl_dataset
 
-    del validation_dataset_path
-
     output_dir = resolve_grpo_output_dir(config)
     output_dir.mkdir(parents=True, exist_ok=True)
+    _maybe_init_wandb(config)
     if config.train_steps <= 0:
         return {
             "model_id": model_id,
@@ -408,6 +523,9 @@ def run_grpo_training(
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 
     train_records = read_jsonl_dataset(train_dataset_path)
+    validation_records = read_jsonl_dataset(validation_dataset_path)
+    if eval_config is not None and eval_config.num_examples is not None:
+        validation_records = validation_records[: eval_config.num_examples]
     if not train_records:
         return {
             "model_id": model_id,
@@ -529,11 +647,27 @@ def run_grpo_training(
         optimizer.step()
 
         losses.append(float(loss.detach().cpu()))
-        log_grpo_metrics(
-            step=step,
-            metrics={**cache["reward_metadata"], **loss_metadata},
-            config=config,
-        )
+        train_metrics = {
+            "loss": loss.detach(),
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            **cache["reward_metadata"],
+            **loss_metadata,
+        }
+        if step % max(1, config.log_every_steps) == 0 or step == 1 or step == config.train_steps:
+            log_grpo_metrics(step=step, metrics=train_metrics, config=config)
+
+        if validation_records and (
+            should_run_evaluation(step, config.eval_every_steps) or step == config.train_steps
+        ):
+            validation_metrics = _evaluate_grpo_validation(
+                model=model,
+                tokenizer=tokenizer,
+                validation_records=validation_records,
+                reward_fn=reward_fn,
+                device=device,
+                eval_config=eval_config,
+            )
+            _log_wandb_metrics(step, validation_metrics, prefix="eval/")
 
         if should_save_checkpoint(step, config.save_every_steps):
             checkpoint_path = save_checkpoint(
