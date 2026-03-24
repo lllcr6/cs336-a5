@@ -339,7 +339,11 @@ def log_grpo_metrics(
     payload: dict[str, Any] = {"step": step}
     for key, value in metrics.items():
         if isinstance(value, torch.Tensor):
-            payload[key] = float(value.detach().mean().cpu().item())
+            detached = value.detach()
+            if detached.dtype.is_floating_point or detached.dtype.is_complex:
+                payload[key] = float(detached.mean().cpu().item())
+            else:
+                payload[key] = int(detached.sum().cpu().item())
         elif isinstance(value, (int, float)):
             payload[key] = float(value)
         else:
