@@ -470,7 +470,9 @@ def _evaluate_sft_generation_validation(
                 responses.append(response)
                 ground_truths.append(ground_truth)
                 reward_info.append(reward_fn(response, ground_truth))
-                response_lengths.append(float(generated[idx].shape[-1] - int(prompt_lengths[idx])))
+                response_lengths.append(
+                    float(generated[idx].shape[-1] - inputs["input_ids"].shape[-1])
+                )
                 token_entropies.append(float(entropy_by_example[idx].item()))
 
     summary: dict[str, float] = {

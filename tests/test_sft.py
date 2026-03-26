@@ -215,6 +215,71 @@ def test_sft_generation_validation_logs_answer_reward_and_response_entropy(monke
     assert "eval/response_length" not in metrics
 
 
+def test_sft_generation_validation_response_length_ignores_left_padding(monkeypatch):
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def __call__(self, prompt, return_tensors="pt"):
+            del prompt, return_tensors
+            return {"input_ids": torch.tensor([[0, 0, 10, 11, 12]], dtype=torch.long)}
+
+        def decode(self, token_ids, skip_special_tokens=True):
+            del token_ids, skip_special_tokens
+            return "generated answer"
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+        def train(self):
+            return self
+
+        def generate(self, **kwargs):
+            del kwargs
+            return torch.tensor([[0, 0, 10, 11, 12, 13, 14]], dtype=torch.long)
+
+    def fake_tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer):
+        del tokenizer
+        assert prompt_strs == ["Question?"]
+        assert output_strs == ["generated answer"]
+        return {
+            "input_ids": torch.tensor([[0, 0, 1, 2, 3]], dtype=torch.long),
+            "labels": torch.tensor([[0, 0, 2, 3, 4]], dtype=torch.long),
+            "response_mask": torch.tensor([[False, False, False, True, True]], dtype=torch.bool),
+        }
+
+    def fake_get_response_log_probs(model, input_ids, labels, return_token_entropy=False):
+        del model, input_ids, labels
+        assert return_token_entropy is True
+        return {
+            "log_probs": torch.tensor([[0.0, 0.0, 0.0, -1.0, -1.0]], dtype=torch.float32),
+            "token_entropy": torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0]], dtype=torch.float32),
+        }
+
+    def fake_reward_fn(response, ground_truth):
+        del response, ground_truth
+        return {"reward": 1.0, "answer_reward": 1.0, "format_reward": 1.0}
+
+    monkeypatch.setattr(sft_module, "tokenize_prompt_and_output", fake_tokenize_prompt_and_output)
+    monkeypatch.setattr(sft_module, "get_response_log_probs", fake_get_response_log_probs)
+
+    metrics = sft_module._evaluate_sft_generation_validation(
+        model=FakeModel(),
+        tokenizer=FakeTokenizer(),
+        validation_records=[{"prompt": "Question?", "answer": "42"}],
+        device=torch.device("cpu"),
+        reward_fn=fake_reward_fn,
+        batch_size=1,
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=4,
+        eval_output_dir=None,
+    )
+
+    assert metrics["eval/generated_response_length_per_example"] == 2.0
+
+
 def test_sft_teacher_forced_validation_uses_explicit_token_metrics(monkeypatch):
     class FakeTokenizer:
         pad_token_id = 0
