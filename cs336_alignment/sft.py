@@ -283,6 +283,23 @@ def _log_wandb_metrics(step: int, metrics: dict[str, Any], *, prefix: str = "tra
     wandb.log(payload, step=step)
 
 
+def _tensor_dict_to_python(metrics: dict[str, Any] | None) -> dict[str, Any] | None:
+    if metrics is None:
+        return None
+
+    converted: dict[str, Any] = {}
+    for key, value in metrics.items():
+        if isinstance(value, torch.Tensor):
+            detached = value.detach().cpu()
+            if detached.numel() == 1:
+                converted[key] = detached.item()
+            else:
+                converted[key] = detached.tolist()
+        else:
+            converted[key] = value
+    return converted
+
+
 def _record_prompt(record: dict[str, Any]) -> str:
     prompt = record.get("prompt")
     if prompt is None:
@@ -796,5 +813,5 @@ def run_sft_training(
         "steps": step,
         "loss": losses[-1] if losses else None,
         "loss_history": losses,
-        "last_microbatch": metadata,
+        "last_microbatch": _tensor_dict_to_python(metadata),
     }
