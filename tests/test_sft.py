@@ -1,3 +1,6 @@
+import sys
+import types
+
 import torch
 
 import cs336_alignment.sft as sft_module
@@ -201,14 +204,18 @@ def test_sft_generation_validation_logs_answer_reward_and_response_entropy(monke
 
     assert rewards_seen == [("generated answer", "42")]
     assert metrics["eval/num_examples"] == 1.0
-    assert metrics["eval/answer_reward"] == 0.75
-    assert metrics["eval/format_reward"] == 0.5
+    assert metrics["eval/answer_reward_mean"] == 0.75
+    assert metrics["eval/format_reward_mean"] == 0.5
     assert metrics["eval/reward_mean"] == 0.75
-    assert metrics["eval/token_entropy"] == 2.0
-    assert metrics["eval/response_length"] == 2.0
+    assert metrics["eval/generated_token_entropy"] == 2.0
+    assert metrics["eval/generated_response_length_per_example"] == 2.0
+    assert "eval/answer_reward" not in metrics
+    assert "eval/format_reward" not in metrics
+    assert "eval/token_entropy" not in metrics
+    assert "eval/response_length" not in metrics
 
 
-def test_sft_teacher_forced_validation_logs_response_entropy(monkeypatch):
+def test_sft_teacher_forced_validation_uses_explicit_token_metrics(monkeypatch):
     class FakeTokenizer:
         pad_token_id = 0
         eos_token_id = 1
@@ -255,5 +262,41 @@ def test_sft_teacher_forced_validation_logs_response_entropy(monkeypatch):
     )
 
     assert metrics["eval/num_examples"] == 1.0
-    assert metrics["eval/token_entropy"] == 2.0
+    assert metrics["eval/nll_per_token"] == 2.5
+    assert metrics["eval/teacher_forced_token_entropy"] == 2.0
+    assert metrics["eval/response_tokens_total"] == 2.0
+    assert metrics["eval/response_tokens_per_example"] == 2.0
     assert "eval/loss" in metrics
+    assert "eval/token_loss" not in metrics
+    assert "eval/token_entropy" not in metrics
+    assert "eval/response_token_count" not in metrics
+
+
+def test_log_wandb_metrics_does_not_duplicate_step(monkeypatch):
+    calls: list[tuple[dict[str, object], int | None]] = []
+    fake_wandb = types.ModuleType("wandb")
+    fake_wandb.run = object()
+    fake_wandb.log = lambda payload, step=None: calls.append((payload, step))
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    sft_module._log_wandb_metrics(
+        7,
+        {
+            "loss": torch.tensor(1.5),
+            "examples_per_step": torch.tensor(4.0),
+            "response_tokens_per_step": torch.tensor(20.0),
+        },
+        prefix="train/",
+    )
+
+    assert calls == [
+        (
+            {
+                "train/loss": 1.5,
+                "train/examples_per_step": 4.0,
+                "train/response_tokens_per_step": 20.0,
+            },
+            7,
+        )
+    ]
+    assert "step" not in calls[0][0]

@@ -1,3 +1,6 @@
+import sys
+import types
+
 import torch
 
 import cs336_alignment.grpo as grpo_module
@@ -75,10 +78,10 @@ def test_compute_group_normalized_rewards_metadata_includes_reward_summaries(
         normalize_by_std=True,
     )
 
-    assert {"reward_mean", "reward", "answer_reward", "format_reward"} <= metadata.keys()
-    assert metadata["reward"] == metadata["reward_mean"]
-    assert metadata["answer_reward"] == metadata["answer_reward_mean"]
-    assert metadata["format_reward"] == metadata["format_reward_mean"]
+    assert {"reward_mean", "answer_reward_mean", "format_reward_mean"} <= metadata.keys()
+    assert "reward" not in metadata
+    assert "answer_reward" not in metadata
+    assert "format_reward" not in metadata
 
 
 def test_compute_naive_policy_gradient_loss(
@@ -306,10 +309,13 @@ def test_log_grpo_metrics_keeps_reward_and_diagnostics(monkeypatch):
             "microbatch_loss": torch.tensor(2.0),
             "masked_loss_mean": torch.tensor(1.0),
             "reward_mean": torch.tensor(0.6),
-            "answer_reward": torch.tensor(0.8),
-            "format_reward": torch.tensor(0.9),
-            "token_entropy": torch.tensor(1.2),
-            "response_length": torch.tensor(42.0),
+            "answer_reward_mean": torch.tensor(0.8),
+            "format_reward_mean": torch.tensor(0.9),
+            "generated_token_entropy": torch.tensor(1.2),
+            "generated_response_length_per_example": torch.tensor(42.0),
+            "examples_per_step": torch.tensor(10.0),
+            "response_tokens_per_step": torch.tensor(100.0),
+            "response_tokens_per_example": torch.tensor(10.0),
             "grad_norm": torch.tensor(0.3),
             "clip_fraction": torch.tensor(0.4),
             "approx_kl": torch.tensor(0.05),
@@ -324,12 +330,46 @@ def test_log_grpo_metrics_keeps_reward_and_diagnostics(monkeypatch):
     assert "masked_loss_mean" not in captured["metrics"]
     for key in [
         "reward_mean",
-        "answer_reward",
-        "format_reward",
-        "token_entropy",
-        "response_length",
+        "answer_reward_mean",
+        "format_reward_mean",
+        "generated_token_entropy",
+        "generated_response_length_per_example",
+        "examples_per_step",
+        "response_tokens_per_step",
+        "response_tokens_per_example",
         "grad_norm",
         "clip_fraction",
         "approx_kl",
     ]:
         assert key in captured["metrics"]
+    assert "response_token_count" not in captured["metrics"]
+    assert "token_entropy" not in captured["metrics"]
+    assert "response_length" not in captured["metrics"]
+
+
+def test_log_wandb_metrics_does_not_duplicate_step(monkeypatch):
+    calls: list[tuple[dict[str, object], int | None]] = []
+    fake_wandb = types.ModuleType("wandb")
+    fake_wandb.run = object()
+    fake_wandb.log = lambda payload, step=None: calls.append((payload, step))
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    grpo_module._log_wandb_metrics(
+        7,
+        {
+            "examples_per_step": torch.tensor(8.0),
+            "response_tokens_per_step": torch.tensor(32.0),
+        },
+        prefix="train/",
+    )
+
+    assert calls == [
+        (
+            {
+                "train/examples_per_step": 8.0,
+                "train/response_tokens_per_step": 32.0,
+            },
+            7,
+        )
+    ]
+    assert "step" not in calls[0][0]

@@ -63,7 +63,7 @@ def compute_group_normalized_rewards(
     for response, ground_truth in zip(rollout_responses, repeated_ground_truths):
         reward_info = reward_fn(response, ground_truth)
         reward_rows.append(reward_info)
-        raw_reward_values.append(float(reward_info.get("reward", 0.0)))
+        raw_reward_values.append(float(reward_info.get("reward", reward_info.get("answer_reward", 0.0))))
 
     raw_rewards = torch.tensor(raw_reward_values, dtype=torch.float32)
     advantages = torch.empty_like(raw_rewards)
@@ -100,7 +100,6 @@ def compute_group_normalized_rewards(
                 [float(row.get(key, 0.0)) for row in reward_rows],
                 dtype=torch.float32,
             )
-            metadata[key] = float(values.mean().item())
             metadata[f"{key}_mean"] = float(values.mean().item())
             metadata[f"{key}_std"] = float(values.std(unbiased=False).item())
 
@@ -378,7 +377,7 @@ def _log_wandb_metrics(step: int, metrics: dict[str, Any], *, prefix: str = "tra
     if getattr(wandb, "run", None) is None:
         return
 
-    payload: dict[str, Any] = {"step": step}
+    payload: dict[str, Any] = {}
     for key, value in metrics.items():
         metric_name = key if key.startswith(("train/", "eval/", "val/", "step")) else f"{prefix}{key}"
         if isinstance(value, torch.Tensor):
@@ -495,6 +494,8 @@ def _evaluate_grpo_validation(
         values = torch.tensor([float(row.get(key, 0.0)) for row in reward_rows], dtype=torch.float32)
         summary[f"eval/{key}_mean"] = float(values.mean().item())
         summary[f"eval/{key}_std"] = float(values.std(unbiased=False).item()) if values.numel() > 1 else 0.0
+    if "eval/answer_reward_mean" in summary:
+        summary["eval/reward_mean"] = summary["eval/answer_reward_mean"]
 
     model.train()
     return summary
@@ -727,6 +728,8 @@ def run_grpo_training(
 
         train_token_entropy = total_entropy / max(total_examples, 1)
         train_response_length = total_response_length / max(total_examples, 1)
+        examples_per_step = torch.tensor(float(total_examples), device=device)
+        response_tokens_per_example = total_response_tokens / examples_per_step.clamp_min(1)
         if config.clip_grad_norm is not None:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
         else:
@@ -741,7 +744,6 @@ def run_grpo_training(
         losses.append(float(loss.detach().cpu()))
         loss_metadata: dict[str, torch.Tensor] = {
             "microbatch_loss": loss.detach(),
-            "response_token_count": total_response_tokens.detach(),
             "masked_loss_mean": (total_masked_loss_mean / max(total_examples, 1)).detach(),
         }
         if clip_stats_seen:
@@ -753,8 +755,11 @@ def run_grpo_training(
             ).detach()
         train_metrics = {
             "learning_rate": optimizer.param_groups[0]["lr"],
-            "token_entropy": train_token_entropy.detach(),
-            "response_length": train_response_length.detach(),
+            "generated_token_entropy": train_token_entropy.detach(),
+            "generated_response_length_per_example": train_response_length.detach(),
+            "examples_per_step": examples_per_step.detach(),
+            "response_tokens_per_step": total_response_tokens.detach(),
+            "response_tokens_per_example": response_tokens_per_example.detach(),
             "grad_norm": grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
             **cache["reward_metadata"],
             **loss_metadata,

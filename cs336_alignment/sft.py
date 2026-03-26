@@ -266,7 +266,7 @@ def _log_wandb_metrics(step: int, metrics: dict[str, Any], *, prefix: str = "tra
     if getattr(wandb, "run", None) is None:
         return
 
-    payload: dict[str, Any] = {"step": step}
+    payload: dict[str, Any] = {}
     for key, value in metrics.items():
         metric_name = key if key.startswith(("train/", "eval/", "val/", "step")) else f"{prefix}{key}"
         if isinstance(value, torch.Tensor):
@@ -387,10 +387,11 @@ def _evaluate_sft_validation(
         "eval/num_examples": total_examples,
         "eval/num_batches": num_batches,
         "eval/loss": avg_loss,
-        "eval/token_loss": avg_token_loss,
-        "eval/token_entropy": avg_token_entropy,
+        "eval/nll_per_token": avg_token_loss,
+        "eval/teacher_forced_token_entropy": avg_token_entropy,
         "eval/perplexity": perplexity,
-        "eval/response_token_count": total_token_count,
+        "eval/response_tokens_total": total_token_count,
+        "eval/response_tokens_per_example": total_token_count / max(total_examples, 1.0),
     }
 
 
@@ -474,18 +475,19 @@ def _evaluate_sft_generation_validation(
 
     summary: dict[str, float] = {
         "eval/num_examples": float(len(validation_records)),
-        "eval/response_length": float(sum(response_lengths) / max(len(response_lengths), 1)),
-        "eval/token_entropy": float(sum(token_entropies) / max(len(token_entropies), 1)),
+        "eval/generated_response_length_per_example": float(
+            sum(response_lengths) / max(len(response_lengths), 1)
+        ),
+        "eval/generated_token_entropy": float(
+            sum(token_entropies) / max(len(token_entropies), 1)
+        ),
     }
     keys = sorted({key for row in reward_info for key in row})
     for key in keys:
         values = torch.tensor([float(row.get(key, 0.0)) for row in reward_info], dtype=torch.float32)
-        summary[f"eval/{key}"] = float(values.mean().item())
         summary[f"eval/{key}_mean"] = float(values.mean().item())
-    if "answer_reward" in keys:
-        summary["eval/reward_mean"] = summary["eval/answer_reward"]
-    elif "reward" in keys:
-        summary["eval/reward_mean"] = summary["eval/reward"]
+    if "eval/answer_reward_mean" in summary:
+        summary["eval/reward_mean"] = summary["eval/answer_reward_mean"]
 
     if eval_output_dir is not None:
         log_generations(
@@ -702,6 +704,8 @@ def run_sft_training(
                 total_examples += microbatch_examples
 
             train_token_entropy = total_entropy / max(total_examples, 1)
+            examples_per_step = torch.tensor(float(total_examples), device=device)
+            response_tokens_per_example = total_response_tokens / examples_per_step.clamp_min(1)
             if config.clip_grad_norm is not None:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), config.clip_grad_norm
@@ -726,10 +730,9 @@ def run_sft_training(
 
             train_metrics = {
                 "loss": loss.detach(),
-                "microbatch_loss": metadata["microbatch_loss"],
-                "response_token_count": metadata["response_token_count"],
-                "response_log_prob_sum": metadata["response_log_prob_sum"],
-                "token_loss": (
+                "response_tokens_per_step": metadata["response_token_count"],
+                "response_logprob_sum_per_step": metadata["response_log_prob_sum"],
+                "nll_per_token": (
                     -metadata["response_log_prob_sum"]
                     / metadata["response_token_count"].clamp_min(1)
                 ),
@@ -737,7 +740,9 @@ def run_sft_training(
                     (-metadata["response_log_prob_sum"])
                     / metadata["response_token_count"].clamp_min(1)
                 ),
-                "token_entropy": train_token_entropy.detach(),
+                "teacher_forced_token_entropy": train_token_entropy.detach(),
+                "examples_per_step": examples_per_step.detach(),
+                "response_tokens_per_example": response_tokens_per_example.detach(),
                 "grad_norm": grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
                 "learning_rate": optimizer.param_groups[0]["lr"],
             }

@@ -46,14 +46,22 @@ def test_expert_iteration_runs_sft_update_on_filtered_dataset(tmp_path, monkeypa
             {"reward": 1.0, "answer_reward": 1.0, "format_reward": 1.0},
             {"reward": 0.0, "answer_reward": 0.0, "format_reward": 0.0},
         ],
-        "summary": {"answer_reward": 0.5, "format_reward": 0.5, "reward_mean": 0.5},
+        "summary": {
+            "answer_reward_mean": 0.5,
+            "format_reward_mean": 0.5,
+            "reward_mean": 0.5,
+        },
     }
     validation_results = {
         "prompts": ["VP1"],
         "responses": ["VR1"],
         "ground_truths": ["VA1"],
         "reward_info": [{"reward": 1.0, "answer_reward": 1.0, "format_reward": 1.0}],
-        "summary": {"answer_reward": 1.0, "format_reward": 1.0, "reward_mean": 1.0},
+        "summary": {
+            "answer_reward_mean": 1.0,
+            "format_reward_mean": 1.0,
+            "reward_mean": 1.0,
+        },
     }
 
     captured = {}
