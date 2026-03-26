@@ -18,6 +18,7 @@ from .config import EvalConfig, GRPOConfig, LossType
 from .tensor_ops import masked_mean
 from .sft import (
     _evaluate_sft_generation_validation,
+    _tokenize_prompt_batch,
     get_response_log_probs,
     tokenize_prompt_and_output,
 )
@@ -452,10 +453,12 @@ def _evaluate_grpo_validation(
 
     model.eval()
     with torch.no_grad():
-        for record in validation_records:
-            prompt = _record_prompt(record)
-            ground_truth = _record_ground_truth(record)
-            inputs = tokenizer(prompt, return_tensors="pt")
+        batch_size = eval_config.batch_size if eval_config is not None else 1
+        for start in range(0, len(validation_records), max(1, batch_size)):
+            batch_records = validation_records[start : start + max(1, batch_size)]
+            prompt_batch = [_record_prompt(record) for record in batch_records]
+            ground_truth_batch = [_record_ground_truth(record) for record in batch_records]
+            inputs = _tokenize_prompt_batch(tokenizer, prompt_batch)
             inputs = {k: v.to(device) for k, v in inputs.items()}
             generated = model.generate(
                 **inputs,
@@ -466,15 +469,17 @@ def _evaluate_grpo_validation(
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
-            response = tokenizer.decode(
-                generated[0][inputs["input_ids"].shape[-1] :],
-                skip_special_tokens=True,
-            )
-            reward_info = reward_fn(response, ground_truth)
-            reward_rows.append(reward_info)
-            reward = float(reward_info.get("reward", reward_info.get("answer_reward", 0.0)))
-            total_rewards.append(reward)
-            answered += 1.0 if reward > 0.0 else 0.0
+            prompt_lengths = inputs["attention_mask"].sum(dim=1).tolist()
+            for idx, ground_truth in enumerate(ground_truth_batch):
+                response = tokenizer.decode(
+                    generated[idx][int(prompt_lengths[idx]) :],
+                    skip_special_tokens=True,
+                )
+                reward_info = reward_fn(response, ground_truth)
+                reward_rows.append(reward_info)
+                reward = float(reward_info.get("reward", reward_info.get("answer_reward", 0.0)))
+                total_rewards.append(reward)
+                answered += 1.0 if reward > 0.0 else 0.0
 
     reward_tensor = torch.tensor(total_rewards, dtype=torch.float32)
     summary: dict[str, float] = {
@@ -768,6 +773,7 @@ def run_grpo_training(
                 validation_records=validation_records,
                 reward_fn=reward_fn,
                 device=device,
+                batch_size=eval_config.batch_size if eval_config is not None else 1,
                 temperature=eval_config.temperature if eval_config is not None else 1.0,
                 top_p=eval_config.top_p if eval_config is not None else 1.0,
                 max_tokens=eval_config.max_tokens if eval_config is not None else 64,

@@ -192,6 +192,7 @@ def test_sft_generation_validation_logs_answer_reward_and_response_entropy(monke
         validation_records=[{"prompt": "Question?", "answer": "42"}],
         device=torch.device("cpu"),
         reward_fn=fake_reward_fn,
+        batch_size=1,
         temperature=0.0,
         top_p=1.0,
         max_tokens=4,

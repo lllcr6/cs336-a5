@@ -132,6 +132,47 @@ def _split_batch_into_microbatches(
     ]
 
 
+def _tokenize_prompt_batch(
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: list[str],
+) -> dict[str, torch.Tensor]:
+    """Tokenize a prompt batch, falling back to manual padding for simple fakes."""
+    try:
+        batch = tokenizer(prompts, return_tensors="pt", padding=True)
+    except TypeError:
+        single_inputs = [tokenizer(prompt, return_tensors="pt") for prompt in prompts]
+        input_rows = [item["input_ids"][0] for item in single_inputs]
+        max_len = max(row.shape[0] for row in input_rows)
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("tokenizer must define a pad_token_id or eos_token_id")
+
+        padded_rows: list[torch.Tensor] = []
+        attention_rows: list[torch.Tensor] = []
+        for row in input_rows:
+            pad_len = max_len - row.shape[0]
+            padded_rows.append(
+                torch.nn.functional.pad(row, (0, pad_len), value=pad_token_id)
+            )
+            attention_rows.append(
+                torch.nn.functional.pad(
+                    torch.ones_like(row, dtype=torch.long),
+                    (0, pad_len),
+                    value=0,
+                )
+            )
+        return {
+            "input_ids": torch.stack(padded_rows, dim=0),
+            "attention_mask": torch.stack(attention_rows, dim=0),
+        }
+
+    if "attention_mask" not in batch:
+        batch["attention_mask"] = torch.ones_like(batch["input_ids"], dtype=torch.long)
+    return batch
+
+
 def get_response_log_probs(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -343,6 +384,7 @@ def _evaluate_sft_generation_validation(
     validation_records: list[dict[str, Any]],
     device: torch.device,
     reward_fn: Callable[[str, str], dict[str, float]] | None,
+    batch_size: int,
     temperature: float,
     top_p: float,
     max_tokens: int,
@@ -362,10 +404,11 @@ def _evaluate_sft_generation_validation(
 
     model.eval()
     with torch.no_grad():
-        for record in validation_records:
-            prompt = _record_prompt(record)
-            ground_truth = _record_ground_truth(record)
-            inputs = tokenizer(prompt, return_tensors="pt")
+        for start in range(0, len(validation_records), max(1, batch_size)):
+            batch_records = validation_records[start : start + max(1, batch_size)]
+            prompt_batch = [_record_prompt(record) for record in batch_records]
+            ground_truth_batch = [_record_ground_truth(record) for record in batch_records]
+            inputs = _tokenize_prompt_batch(tokenizer, prompt_batch)
             inputs = {k: v.to(device) for k, v in inputs.items()}
             do_sample = temperature > 0.0
             generate_kwargs: dict[str, Any] = {
@@ -381,11 +424,15 @@ def _evaluate_sft_generation_validation(
                 **inputs,
                 **generate_kwargs,
             )
-            response = tokenizer.decode(
-                generated[0][inputs["input_ids"].shape[-1] :],
-                skip_special_tokens=True,
-            )
-            tokenized = tokenize_prompt_and_output([prompt], [response], tokenizer)
+            prompt_lengths = inputs["attention_mask"].sum(dim=1).tolist()
+            response_batch = [
+                tokenizer.decode(
+                    generated[idx][int(prompt_lengths[idx]) :],
+                    skip_special_tokens=True,
+                )
+                for idx in range(len(batch_records))
+            ]
+            tokenized = tokenize_prompt_and_output(prompt_batch, response_batch, tokenizer)
             tokenized = {k: v.to(device) for k, v in tokenized.items()}
             outputs = get_response_log_probs(
                 model=model,
@@ -393,15 +440,20 @@ def _evaluate_sft_generation_validation(
                 labels=tokenized["labels"],
                 return_token_entropy=True,
             )
-
-            prompts.append(prompt)
-            responses.append(response)
-            ground_truths.append(ground_truth)
-            reward_info.append(reward_fn(response, ground_truth))
-            response_lengths.append(float(generated[0].shape[-1] - inputs["input_ids"].shape[-1]))
-            token_entropies.append(
-                float(_aggregate_masked_metric(outputs["token_entropy"], tokenized["response_mask"]).mean().item())
+            entropy_by_example = _aggregate_masked_metric(
+                outputs["token_entropy"],
+                tokenized["response_mask"],
             )
+
+            for idx, (prompt, response, ground_truth) in enumerate(
+                zip(prompt_batch, response_batch, ground_truth_batch)
+            ):
+                prompts.append(prompt)
+                responses.append(response)
+                ground_truths.append(ground_truth)
+                reward_info.append(reward_fn(response, ground_truth))
+                response_lengths.append(float(generated[idx].shape[-1] - int(prompt_lengths[idx])))
+                token_entropies.append(float(entropy_by_example[idx].item()))
 
     summary: dict[str, float] = {
         "eval/num_examples": float(len(validation_records)),
@@ -696,6 +748,7 @@ def run_sft_training(
                             validation_records=validation_records,
                             device=device,
                             reward_fn=reward_fn,
+                            batch_size=eval_config.batch_size if eval_config is not None else 1,
                             temperature=eval_config.temperature if eval_config is not None else 0.0,
                             top_p=eval_config.top_p if eval_config is not None else 1.0,
                             max_tokens=eval_config.max_tokens if eval_config is not None else 64,
