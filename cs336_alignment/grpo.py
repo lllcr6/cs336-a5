@@ -305,6 +305,22 @@ def should_refresh_old_log_probs(
     return epochs_per_rollout_batch > 0 and (step - 1) % epochs_per_rollout_batch == 0
 
 
+def _split_batch_into_microbatches(
+    batch_size: int,
+    gradient_accumulation_steps: int,
+) -> list[slice]:
+    """Split a logical batch into up to ``gradient_accumulation_steps`` slices."""
+    if batch_size <= 0:
+        return []
+
+    microbatch_count = max(1, min(batch_size, gradient_accumulation_steps))
+    microbatch_size = math.ceil(batch_size / microbatch_count)
+    return [
+        slice(start, min(start + microbatch_size, batch_size))
+        for start in range(0, batch_size, microbatch_size)
+    ]
+
+
 def build_grpo_run_name(
     base_name: str,
     loss_type: LossType,
@@ -636,30 +652,75 @@ def run_grpo_training(
                 "reward_metadata": reward_metadata,
             }
 
+        microbatch_slices = _split_batch_into_microbatches(
+            cache["tokenized"]["input_ids"].shape[0],
+            config.gradient_accumulation_steps,
+        )
+        accumulation_steps = len(microbatch_slices)
         optimizer.zero_grad(set_to_none=True)
-        current_outputs = get_response_log_probs(
-            model=model,
-            input_ids=cache["tokenized"]["input_ids"],
-            labels=cache["tokenized"]["labels"],
-            return_token_entropy=True,
-        )
-        current_log_probs = current_outputs["log_probs"]
-        loss, loss_metadata = grpo_microbatch_train_step(
-            policy_log_probs=current_log_probs,
-            response_mask=cache["tokenized"]["response_mask"],
-            gradient_accumulation_steps=config.gradient_accumulation_steps,
-            loss_type=config.loss_type,
-            raw_rewards=cache["raw_rewards"] if config.loss_type == "no_baseline" else None,
-            advantages=cache["advantages"] if config.loss_type != "no_baseline" else None,
-            old_log_probs=cache["old_log_probs"] if config.loss_type == "grpo_clip" else None,
-            cliprange=config.cliprange,
-        )
-        train_token_entropy = masked_mean(
-            current_outputs["token_entropy"],
-            cache["tokenized"]["response_mask"],
-            dim=1,
-        ).mean()
-        train_response_length = cache["tokenized"]["response_mask"].sum(dim=1).float().mean()
+        loss = torch.zeros((), device=device)
+        total_entropy = torch.zeros((), device=device)
+        total_response_length = torch.zeros((), device=device)
+        total_examples = 0
+        total_response_tokens = torch.zeros((), device=device)
+        total_masked_loss_mean = torch.zeros((), device=device)
+        total_clipfrac_numerator = torch.zeros((), device=device)
+        total_approx_kl_numerator = torch.zeros((), device=device)
+        clip_stats_seen = False
+        for microbatch_slice in microbatch_slices:
+            tokenized_microbatch = {
+                key: value[microbatch_slice]
+                for key, value in cache["tokenized"].items()
+            }
+            current_outputs = get_response_log_probs(
+                model=model,
+                input_ids=tokenized_microbatch["input_ids"],
+                labels=tokenized_microbatch["labels"],
+                return_token_entropy=True,
+            )
+            current_log_probs = current_outputs["log_probs"]
+            microbatch_loss, microbatch_metadata = grpo_microbatch_train_step(
+                policy_log_probs=current_log_probs,
+                response_mask=tokenized_microbatch["response_mask"],
+                gradient_accumulation_steps=accumulation_steps,
+                loss_type=config.loss_type,
+                raw_rewards=cache["raw_rewards"][microbatch_slice] if config.loss_type == "no_baseline" else None,
+                advantages=cache["advantages"][microbatch_slice] if config.loss_type != "no_baseline" else None,
+                old_log_probs=cache["old_log_probs"][microbatch_slice] if config.loss_type == "grpo_clip" else None,
+                cliprange=config.cliprange,
+            )
+            microbatch_examples = tokenized_microbatch["input_ids"].shape[0]
+            microbatch_token_entropy = masked_mean(
+                current_outputs["token_entropy"],
+                tokenized_microbatch["response_mask"],
+                dim=1,
+            ).mean()
+            microbatch_response_length = (
+                tokenized_microbatch["response_mask"].sum(dim=1).float().mean()
+            )
+            loss = loss + microbatch_loss.detach()
+            total_entropy = total_entropy + (microbatch_token_entropy.detach() * microbatch_examples)
+            total_response_length = total_response_length + (
+                microbatch_response_length.detach() * microbatch_examples
+            )
+            total_examples += microbatch_examples
+            total_response_tokens = total_response_tokens + microbatch_metadata["response_token_count"]
+            total_masked_loss_mean = total_masked_loss_mean + (
+                microbatch_metadata["masked_loss_mean"] * microbatch_examples
+            )
+            if "clip_fraction" in microbatch_metadata:
+                clip_stats_seen = True
+                total_clipfrac_numerator = total_clipfrac_numerator + (
+                    microbatch_metadata["clip_fraction"] * microbatch_examples
+                )
+            if "approx_kl" in microbatch_metadata:
+                clip_stats_seen = True
+                total_approx_kl_numerator = total_approx_kl_numerator + (
+                    microbatch_metadata["approx_kl"] * microbatch_examples
+                )
+
+        train_token_entropy = total_entropy / max(total_examples, 1)
+        train_response_length = total_response_length / max(total_examples, 1)
         if config.clip_grad_norm is not None:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
         else:
@@ -672,6 +733,18 @@ def run_grpo_training(
         optimizer.step()
 
         losses.append(float(loss.detach().cpu()))
+        loss_metadata: dict[str, torch.Tensor] = {
+            "microbatch_loss": loss.detach(),
+            "response_token_count": total_response_tokens.detach(),
+            "masked_loss_mean": (total_masked_loss_mean / max(total_examples, 1)).detach(),
+        }
+        if clip_stats_seen:
+            loss_metadata["clip_fraction"] = (
+                total_clipfrac_numerator / max(total_examples, 1)
+            ).detach()
+            loss_metadata["approx_kl"] = (
+                total_approx_kl_numerator / max(total_examples, 1)
+            ).detach()
         train_metrics = {
             "learning_rate": optimizer.param_groups[0]["lr"],
             "token_entropy": train_token_entropy.detach(),
