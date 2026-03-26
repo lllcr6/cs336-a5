@@ -547,6 +547,7 @@ def run_grpo_training(
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AutoModelForCausalLM.from_pretrained(model_id)
