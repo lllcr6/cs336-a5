@@ -116,6 +116,22 @@ def _aggregate_masked_metric(values: torch.Tensor, response_mask: torch.Tensor) 
     return masked_mean(values, response_mask, dim=1)
 
 
+def _split_batch_into_microbatches(
+    batch_size: int,
+    gradient_accumulation_steps: int,
+) -> list[slice]:
+    """Split a logical batch into up to ``gradient_accumulation_steps`` slices."""
+    if batch_size <= 0:
+        return []
+
+    microbatch_count = max(1, min(batch_size, gradient_accumulation_steps))
+    microbatch_size = math.ceil(batch_size / microbatch_count)
+    return [
+        slice(start, min(start + microbatch_size, batch_size))
+        for start in range(0, batch_size, microbatch_size)
+    ]
+
+
 def get_response_log_probs(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -573,22 +589,49 @@ def run_sft_training(
             batch = tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
             batch = {k: v.to(device) for k, v in batch.items()}
 
+            microbatch_slices = _split_batch_into_microbatches(
+                batch["input_ids"].shape[0],
+                config.gradient_accumulation_steps,
+            )
+            accumulation_steps = len(microbatch_slices)
             optimizer.zero_grad(set_to_none=True)
-            outputs = get_response_log_probs(
-                model=model,
-                input_ids=batch["input_ids"],
-                labels=batch["labels"],
-                return_token_entropy=True,
-            )
-            loss, metadata = sft_microbatch_train_step(
-                policy_log_probs=outputs["log_probs"],
-                response_mask=batch["response_mask"],
-                gradient_accumulation_steps=config.gradient_accumulation_steps,
-                normalize_constant=config.normalize_constant,
-            )
-            train_token_entropy = _aggregate_masked_metric(
-                outputs["token_entropy"], batch["response_mask"]
-            ).mean()
+            loss = torch.zeros((), device=device)
+            total_response_tokens = torch.zeros((), device=device)
+            total_response_log_prob_sum = torch.zeros((), device=device)
+            total_entropy = torch.zeros((), device=device)
+            total_examples = 0
+            for microbatch_slice in microbatch_slices:
+                microbatch = {
+                    key: value[microbatch_slice]
+                    for key, value in batch.items()
+                }
+                outputs = get_response_log_probs(
+                    model=model,
+                    input_ids=microbatch["input_ids"],
+                    labels=microbatch["labels"],
+                    return_token_entropy=True,
+                )
+                microbatch_loss, metadata = sft_microbatch_train_step(
+                    policy_log_probs=outputs["log_probs"],
+                    response_mask=microbatch["response_mask"],
+                    gradient_accumulation_steps=accumulation_steps,
+                    normalize_constant=config.normalize_constant,
+                )
+                microbatch_examples = microbatch["input_ids"].shape[0]
+                microbatch_entropy = _aggregate_masked_metric(
+                    outputs["token_entropy"], microbatch["response_mask"]
+                ).mean()
+                loss = loss + microbatch_loss.detach()
+                total_response_tokens = total_response_tokens + metadata["response_token_count"]
+                total_response_log_prob_sum = (
+                    total_response_log_prob_sum + metadata["response_log_prob_sum"]
+                )
+                total_entropy = total_entropy + (
+                    microbatch_entropy.detach() * microbatch_examples
+                )
+                total_examples += microbatch_examples
+
+            train_token_entropy = total_entropy / max(total_examples, 1)
             if config.clip_grad_norm is not None:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), config.clip_grad_norm
@@ -600,9 +643,13 @@ def run_sft_training(
                     if parameter.grad is not None
                 ]
                 grad_norm = torch.linalg.vector_norm(torch.stack(grads), ord=2) if grads else torch.tensor(0.0, device=device)
-            metadata = dict(metadata)
-            metadata["token_entropy"] = train_token_entropy.detach()
-            metadata["grad_norm"] = grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
+            metadata = {
+                "microbatch_loss": loss.detach(),
+                "response_token_count": total_response_tokens.detach(),
+                "response_log_prob_sum": total_response_log_prob_sum.detach(),
+                "token_entropy": train_token_entropy.detach(),
+                "grad_norm": grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device),
+            }
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
             step += 1
