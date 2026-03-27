@@ -1,30 +1,58 @@
-# CS336 Spring 2025 Assignment 5: Alignment
+# GSM8K Alignment Experiments
 
-For a full description of the assignment, see the assignment handout at
-[cs336_spring2025_assignment5_alignment.pdf](./cs336_spring2025_assignment5_alignment.pdf)
+This repository contains my alignment experiments on GSM8K, inspired by the CS336 Assignment 5 alignment task.
+The core training code lives under [`cs336_alignment/`](./cs336_alignment), and the
+end-to-end experiment workflow is documented in
+[`notebooks/sft_grpo_on_gsm8k_qwen2.5_math_1.5b.ipynb`](./notebooks/sft_grpo_on_gsm8k_qwen2.5_math_1.5b.ipynb).
 
-We include a supplemental (and completely optional) assignment on safety alignment, instruction tuning, and RLHF at [cs336_spring2025_assignment5_supplement_safety_rlhf.pdf](./cs336_spring2025_assignment5_supplement_safety_rlhf.pdf)
+I also ran the notebook on Colab and tracked the experiments in Weights & Biases:
 
-If you see any issues with the assignment handout or code, please feel free to
-raise a GitHub issue or open a pull request with a fix.
+- Colab notebook: <https://colab.research.google.com/drive/1WA5OMfAWSqJRAll4Y_imFLXMhp9mko48?usp=sharing>
+- W&B workspace: <https://wandb.ai/chenrui6/cs336-assignment5-alignment/workspace?nw=nwuserchenruiliu66>
+
+## What’s Included
+
+The project includes:
+
+- **SFT** in [`cs336_alignment/sft.py`](./cs336_alignment/sft.py)
+- **GRPO** in [`cs336_alignment/grpo.py`](./cs336_alignment/grpo.py)
+- supporting data, metrics, evaluation, checkpointing, and vLLM utilities in [`cs336_alignment/`](./cs336_alignment)
+- a reproducible Colab notebook in [`notebooks/`](./notebooks) that runs:
+  - a zero-shot GSM8K baseline
+  - SFT with reasoning traces
+  - GRPO with verified rewards
+
+To make the training runs fit on limited GPU memory, I used **gradient accumulation** to increase the effective batch size while running on a single Colab A100.
+
+## Results Summary
+
+The plots below summarize the main observations from the notebook runs.
+
+### Baseline
+
+The zero-shot baseline on GSM8K reaches an answer reward mean of about **0.572**.
+
+![Baseline result](./img/baseline_result.png)
+
+### SFT
+
+SFT shows a clear drop in training loss, but the evaluation accuracy/reward is not as strong as the zero-shot baseline. In other words, optimization improved the training objective, but that did not translate into better GSM8K evaluation performance.
+
+![SFT training](./img/sft_train.png)
+
+![SFT evaluation](./img/sft_eval.png)
+
+### GRPO
+
+GRPO improves evaluation reward more consistently. By **step 50**, the eval reward is around **0.68**, and the curve does not show an obvious plateau or overfitting signal in the logged run.
+
+![GRPO evaluation](./img/grpo_eval.png)
 
 ## Setup
 
-As in previous assignments, we use `uv` to manage dependencies.
+If you are using the Colab notebook, the notebook handles environment setup and dependency installation for you.
 
-1. Install all packages except `flash-attn`, then all packages (`flash-attn` is weird)
-```
-uv sync --no-install-package flash-attn
-uv sync
-```
 
-2. Run unit tests:
+## References
 
-``` sh
-uv run pytest
-```
-
-Initially, all tests should fail with `NotImplementedError`s.
-To connect your implementation to the tests, complete the
-functions in [./tests/adapters.py](./tests/adapters.py).
-
+- CS336 Assignment 5 alignment repo: <https://github.com/stanford-cs336/assignment5-alignment>
